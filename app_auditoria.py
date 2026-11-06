@@ -270,7 +270,7 @@ for pl in plates:
     prev="Sem informação"
     prev_date=""
     # Fotografia anterior mais recente que seja anterior à OS mais antiga da placa.
-    first_os=os_rows.dt.min().date()
+    first_os=os_rows["dt"].min().date()
     for d in reversed(earlier):
         if date.fromisoformat(d)>=first_os: continue
         matching=health[(health.data_base==d)&(health.placa==pl)]
@@ -281,7 +281,7 @@ for pl in plates:
     elif movement=="Piorou":result="Piorou (confirmado entre fotografias)"
     elif movement=="Permaneceu igual":result="Sem mudança confirmada"
     else:result="Sem comparação anterior"
-    by_plate.append({"Placa":pl,"OS concluídas":len(os_rows),"Última OS":str(last.os),"Último serviço":last.dt.strftime("%d/%m/%Y"),"Tipo":last.classe,"Oficina":last.oficina,"Cliente":last.cliente,"Saúde atual":now,"Situação operacional":current_op.get(pl,"Não informado"),"Saúde anterior":prev,"Data anterior":prev_date,"Evolução":result})
+    by_plate.append({"Placa":pl,"OS concluídas":len(os_rows),"Última OS":str(last["os"]),"Último serviço":pd.to_datetime(last["dt"],errors="coerce").strftime("%d/%m/%Y") if pd.notna(pd.to_datetime(last["dt"],errors="coerce")) else "Data não informada","Tipo":last.classe,"Oficina":last.oficina,"Cliente":last.cliente,"Saúde atual":now,"Situação operacional":current_op.get(pl,"Não informado"),"Saúde anterior":prev,"Data anterior":prev_date,"Evolução":result})
 detail=pd.DataFrame(by_plate)
 valid=detail["Saúde atual"].isin(["Saudável","Avalie","Atenção"])
 healthy=int((detail["Saúde atual"]=="Saudável").sum())
