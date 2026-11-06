@@ -234,7 +234,7 @@ for a,b in zip(days[:-1],days[1:]):
         details.append({"Início":a,"Fim":b,"Placa":pl,"Antes":x,"Depois":y,"Evolução":change,"OS concluídas":len(pj),"Manutenções":int((pj.classe=="Manutenção").sum()),"Instalações":int((pj.classe=="Instalação").sum()),"Protocolos":", ".join(pj.os.fillna("").astype(str).unique()),"Avaliação":outcome})
     for _,r in jobs.iterrows():
         x=health_value(a,r.placa);y=health_value(b,r.placa)
-        results.append({"Início":a,"Fim":b,"Data OS":r.dt,"OS":r.os,"Placa":r.placa,"Cliente":r.cliente,"Tipo":r.classe,"Serviço":r.tipo,"Oficina":r.oficina,"Saúde antes":x,"Saúde depois":y,"Evolução":evolve(x,y)})
+        results.append({"Início":a,"Fim":b,"Data OS":r["dt"],"OS":r.os,"Placa":r.placa,"Cliente":r.cliente,"Tipo":r.classe,"Serviço":r.tipo,"Oficina":r.oficina,"Saúde antes":x,"Saúde depois":y,"Evolução":evolve(x,y)})
 detail=pd.DataFrame(details);job_detail=pd.DataFrame(results)
 if not detail.empty:
     k=detail[detail["OS concluídas"]>0]
