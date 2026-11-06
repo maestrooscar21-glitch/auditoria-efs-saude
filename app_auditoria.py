@@ -78,7 +78,7 @@ def import_efs(files):
     return inserted,skipped
 def operacao_status(value):
     n=norm(value)
-    if not n or n in ("NAN","NONE","NULL"): return "Não informado"
+    if not n or n in ("NAN","NONE","NULL","-"): return "Não informado"
     if "SINISTR" in n: return "Sinistrado"
     if "CANCEL" in n: return "Cancelado"
     if "FORA DE OPER" in n or "INOPERANTE" in n: return "Fora de operação"
@@ -90,7 +90,7 @@ def import_health(f,day,coverage):
     d=read(f); p=col(d,"PLACA"); s=col(d,"STATUS","STATUS SAUDE","SAÚDE","SAUDE","SITUAÇÃO")
     if not p or not s:raise ValueError(f"{f.name}: precisa conter PLACA e STATUS")
     # Situação operacional é independente do status de saúde.
-    opcol=col(d,"SITUAÇÃO OPERACIONAL","SITUACAO OPERACIONAL","STATUS OPERACIONAL","STATUS DO VEÍCULO","STATUS DO VEICULO","SITUAÇÃO DO VEÍCULO","SITUACAO DO VEICULO","OPERAÇÃO","OPERACAO")
+    opcol=col(d,"SITUAÇÃO","SITUACAO","SITUAÇÃO OPERACIONAL","SITUACAO OPERACIONAL","STATUS OPERACIONAL","STATUS DO VEÍCULO","STATUS DO VEICULO","SITUAÇÃO DO VEÍCULO","SITUACAO DO VEICULO","OPERAÇÃO","OPERACAO")
     records={}; operations={}
     for _,r in d.iterrows():
         pl=plate(r[p])
