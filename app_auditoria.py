@@ -20,7 +20,7 @@ def read(f):
     if f.name.lower().endswith((".xlsx",".xlsm")):
         return pd.read_excel(io.BytesIO(raw),dtype=str,engine="openpyxl").rename(columns=lambda c:str(c).strip())
     for enc in ("utf-8-sig","cp1252","latin1"):
-        for sep in (";",",","\\t"):
+        for sep in (";",",","\t"):
             try:
                 d=pd.read_csv(io.BytesIO(raw),encoding=enc,sep=sep,dtype=str,low_memory=False)
                 if len(d.columns)>2: return d.rename(columns=lambda c:str(c).strip())
@@ -33,12 +33,27 @@ def status(x):
     if "ATEN" in n:return "Atenção"
     return "Sem informação"
 def grade(x): return {"Atenção":0,"Avalie":1,"Saudável":2}.get(x)
+def classificar_servico(x):
+    """Classificação exclusiva: retirada sempre excluída, inclusive em nomes compostos."""
+    n=norm(x)
+    if any(t in n for t in ("RETIRADA", "RETIRAR", "DESINSTAL", "REMOCAO", "REMOVER")):
+        return None
+    if "REINSTAL" in n: return "Reinstalação"
+    if "MANUTEN" in n: return "Manutenção"
+    if "INSTAL" in n: return "Instalação"
+    return None
+
+def concluida(x):
+    n=norm(x)
+    return "CONCLUID" in n and not any(t in n for t in ("NAO CONCLUID", "N CONCLUID", "INCONCLUID"))
+
 def rota(x):
     return any(t in norm(x) for t in ("ROTA TRANSP","CIDADE SOL","GRUPO BRASILEIRO","BRASILEIRO ROTA","VIACAO GQE","AVIACAO GQE","GQE"))
 def init():
     with sqlite3.connect(DB) as c:
         c.execute("CREATE TABLE IF NOT EXISTS servicos (chave TEXT PRIMARY KEY, placa TEXT, cliente TEXT, os TEXT, data TEXT, tipo TEXT, classe TEXT, status TEXT, oficina TEXT, origem TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS saude (data_base TEXT, placa TEXT, status TEXT, origem TEXT, PRIMARY KEY(data_base,placa))")
+        c.execute("CREATE TABLE IF NOT EXISTS operacao (data_base TEXT, placa TEXT, situacao TEXT, PRIMARY KEY(data_base,placa))")
         c.execute("CREATE TABLE IF NOT EXISTS fotografias (data_base TEXT PRIMARY KEY, cobertura TEXT NOT NULL, arquivo TEXT, importado_em TEXT DEFAULT CURRENT_TIMESTAMP)")
 def import_efs(files):
     inserted=0; skipped=0
@@ -50,27 +65,44 @@ def import_efs(files):
             if not dt: raise ValueError(f"{f.name}: coluna de data não identificada; necessário para a cronologia")
             for _,r in d.iterrows():
                 pl=plate(r[p]); s=norm(r[sta])
-                if not pl or "CONCLUID" not in s or "NAO CONCLUID" in s: continue
+                if not pl or not concluida(s): continue
                 data=pd.to_datetime(r[dt],dayfirst=True,errors="coerce")
                 if pd.isna(data):skipped+=1;continue
-                typv=str(r[typ]); classe="Manutenção" if "MANUTEN" in norm(typv) else ("Instalação" if "INSTAL" in norm(typv) else "Outros")
+                typv=str(r[typ]); classe=classificar_servico(typv)
+                if classe is None: continue
                 oid=str(r[oscol]).strip() if oscol and pd.notna(r[oscol]) else ""
                 aid=str(r[idcol]).strip() if idcol and pd.notna(r[idcol]) else ""
                 key=("OS:"+oid if oid else "ID:"+aid if aid else "HASH:"+hashlib.sha256((pl+str(r[cli])+typv+data.isoformat()).encode()).hexdigest())
                 c.execute("INSERT OR REPLACE INTO servicos VALUES (?,?,?,?,?,?,?,?,?,?)",(key,pl,str(r[cli]),oid,data.isoformat(),typv,classe,str(r[sta]),str(r[of]) if of else "",f.name))
                 inserted+=1
     return inserted,skipped
+def operacao_status(value):
+    n=norm(value)
+    if not n or n in ("NAN","NONE","NULL"): return "Não informado"
+    if "SINISTR" in n: return "Sinistrado"
+    if "CANCEL" in n: return "Cancelado"
+    if "FORA DE OPER" in n or "INOPERANTE" in n: return "Fora de operação"
+    if "EM MANUTEN" in n or n=="MANUTENCAO": return "Em manutenção"
+    if "EM OPER" in n or n in ("OPERANDO","ATIVO","ATIVA","OPERACIONAL"): return "Em operação"
+    return "Não informado"
+
 def import_health(f,day,coverage):
     d=read(f); p=col(d,"PLACA"); s=col(d,"STATUS","STATUS SAUDE","SAÚDE","SAUDE","SITUAÇÃO")
     if not p or not s:raise ValueError(f"{f.name}: precisa conter PLACA e STATUS")
-    records={}
+    # Situação operacional é independente do status de saúde.
+    opcol=col(d,"SITUAÇÃO OPERACIONAL","SITUACAO OPERACIONAL","STATUS OPERACIONAL","STATUS DO VEÍCULO","STATUS DO VEICULO","SITUAÇÃO DO VEÍCULO","SITUACAO DO VEICULO","OPERAÇÃO","OPERACAO")
+    records={}; operations={}
     for _,r in d.iterrows():
         pl=plate(r[p])
-        if pl:records[pl]=status(r[s])
+        if pl:
+            records[pl]=status(r[s])
+            operations[pl]=operacao_status(r[opcol]) if opcol else "Não informado"
     with sqlite3.connect(DB) as c:
         # Reimportação de uma fotografia substitui completamente a fotografia anterior, sem sobras.
         c.execute("DELETE FROM saude WHERE data_base=?",(str(day),))
+        c.execute("DELETE FROM operacao WHERE data_base=?",(str(day),))
         c.executemany("INSERT INTO saude VALUES (?,?,?,?)",[(str(day),p,v,f.name) for p,v in records.items()])
+        c.executemany("INSERT INTO operacao VALUES (?,?,?)",[(str(day),p,v) for p,v in operations.items()])
         c.execute("INSERT OR REPLACE INTO fotografias(data_base,cobertura,arquivo) VALUES (?,?,?)",(str(day),coverage,f.name))
     return len(records)
 def evolve(a,b):
@@ -79,8 +111,8 @@ def evolve(a,b):
     return "Melhorou" if y>x else "Piorou" if y<x else "Permaneceu igual"
 def csv_bytes(d):return d.to_csv(index=False,sep=";").encode("utf-8-sig")
 init()
-st.title("🚛 Auditoria cronológica EFS × Saúde da frota")
-st.caption("Fotografias sucessivas + OS concluídas entre elas. Melhorias após serviço são associações temporais, não prova de causalidade.")
+st.title("🚛 Grupo Rota | Visão executiva")
+st.caption("1. Saúde e operação da frota  •  2. Resultado dos serviços concluídos")
 with st.sidebar:
     st.header("1 · Importar")
     f_health=st.file_uploader("Fotografia de saúde (CSV ou XLSX)",type=["csv","xlsx"],key="health")
@@ -116,7 +148,7 @@ with st.sidebar:
     if st.button("Restaurar backup",disabled=restore is None,use_container_width=True):
         try:
             b=restore.getvalue()
-            if not b.startswith(b"SQLite format 3\\x00"):raise ValueError("Não é SQLite")
+            if not b.startswith(b"SQLite format 3\x00"):raise ValueError("Não é SQLite")
             temp=DB+".restore"
             with open(temp,"wb") as f:f.write(b)
             with sqlite3.connect(temp) as c:
@@ -133,124 +165,169 @@ with st.sidebar:
     typed=st.text_input("Digite ZERAR para confirmar")
     if st.button("🗑️ Zerar banco",disabled=not(sure and typed=="ZERAR"),use_container_width=True):
         with sqlite3.connect(DB) as c:
-            c.execute("DELETE FROM servicos");c.execute("DELETE FROM saude");c.execute("DELETE FROM fotografias")
+            c.execute("DELETE FROM servicos");c.execute("DELETE FROM saude");c.execute("DELETE FROM operacao");c.execute("DELETE FROM fotografias")
         st.rerun()
 with sqlite3.connect(DB) as c:
     photos=pd.read_sql_query("SELECT data_base,cobertura,arquivo FROM fotografias ORDER BY data_base",c)
     health=pd.read_sql_query("SELECT * FROM saude",c)
     services=pd.read_sql_query("SELECT * FROM servicos",c)
+    operation=pd.read_sql_query("SELECT * FROM operacao",c)
 if not health.empty and photos.empty:
     st.warning("Fotografias antigas sem abrangência declarada foram consideradas filtradas até confirmação.")
     with sqlite3.connect(DB) as c:
         for d in health.data_base.unique():
             c.execute("INSERT OR IGNORE INTO fotografias(data_base,cobertura,arquivo) VALUES (?,?,?)",(d,"filtrada","importação anterior"))
     with sqlite3.connect(DB) as c:photos=pd.read_sql_query("SELECT data_base,cobertura,arquivo FROM fotografias ORDER BY data_base",c)
-st.subheader("📚 Fotografias registradas")
+
+# Painel executivo: uma fotografia atual basta; histórico anterior é opcional.
 if photos.empty:
-    st.info("Importe a primeira fotografia, marcando se o arquivo é completo ou filtrado.")
+    st.info("Importe uma fotografia de saúde para começar. Você pode importar as OS antes ou depois.")
     st.stop()
-pcount=health.groupby("data_base").agg(placas=("placa","nunique")).reset_index()
-st.dataframe(photos.merge(pcount,on="data_base",how="left").fillna({"placas":0}),hide_index=True,use_container_width=True)
+photos=photos.sort_values("data_base")
 dates=photos.data_base.tolist()
-if len(dates)<2:
-    st.info("Importe a segunda fotografia para habilitar a comparação cronológica.")
-    st.stop()
 with st.sidebar:
-    st.header("3 · Análise")
-    end=st.selectbox("Fotografia final",dates,index=len(dates)-1)
-    before=[d for d in dates if d<end]
-    start=st.selectbox("Fotografia inicial",before,index=len(before)-1) if before else None
-    only_rota=st.checkbox("Somente OS do Grupo Rota",value=True)
-    extra=st.text_input("Outros nomes do grupo (separados por ;)")
-    selected=st.multiselect("Tipos de OS",["Manutenção","Instalação","Outros"],default=["Manutenção","Instalação"])
-if not start:
-    st.info("Escolha uma fotografia final posterior à inicial.")
-    st.stop()
-subset=photos[(photos.data_base>=start)&(photos.data_base<=end)].copy()
-days=subset.data_base.tolist()
-health["categoria"]=health.status.map(status)
-health_by_day={d:health[health.data_base==d].drop_duplicates("placa").set_index("placa").categoria.to_dict() for d in days}
-coverage_by_day=dict(zip(photos.data_base,photos.cobertura))
-# A ausência em arquivo filtrado é DESCONHECIDA; ausência em completo = não localizado na frota.
-def health_value(day,pl):
-    return health_by_day[day].get(pl,"Não localizado" if coverage_by_day[day]=="completa" else "Sem informação (base filtrada)")
+    st.header("3 · Resultado")
+    end=st.selectbox("Fotografia atual",dates,index=len(dates)-1)
+    first=date.fromisoformat(dates[0])
+    start=st.date_input("Serviços executados a partir de",value=first,max_value=date.fromisoformat(end),key="period_start")
+    selected=st.multiselect("Tipos de serviço",["Manutenção","Instalação","Reinstalação"],default=["Manutenção"],key="service_types")
+    only_rota=st.checkbox("Somente Grupo Rota",value=True)
+    extra=st.text_input("Outros nomes do Grupo Rota (separados por ;)")
+    st.caption("As datas inicial e final são inclusivas. A fotografia final deve ter sido extraída depois dos serviços para confirmar o estado posterior.")
+
+snap=health[health.data_base==end].drop_duplicates("placa").copy()
+snap["estado"]=snap.status.map(status)
+ops=operation[operation.data_base==end][["placa","situacao"]].drop_duplicates("placa") if not operation.empty else pd.DataFrame(columns=["placa","situacao"])
+snap=snap.merge(ops,on="placa",how="left")
+snap["situacao"]=snap.situacao.fillna("Não informado")
+current_op=dict(zip(snap.placa,snap.situacao))
+current=dict(zip(snap.placa,snap.estado))
+coverage=dict(zip(photos.data_base,photos.cobertura))
 if not services.empty:
     services["dt"]=pd.to_datetime(services.data,errors="coerce")
-    terms=[norm(v) for v in extra.split(";") if v.strip()]
-    if only_rota:services=services[services.cliente.map(lambda x:rota(x) or any(t in norm(x) for t in terms))]
-    services=services[services.classe.isin(selected)]
-    services=services[services.dt.notna()].copy()
-else:services["dt"]=pd.Series(dtype="datetime64[ns]")
-# Datas sem hora: OS no dia da fotografia não pode ser ordenada com segurança.
-def interval_os(a,b):
-    low=pd.Timestamp(a); high=pd.Timestamp(b)
-    return services[(services.dt.dt.normalize()>low)&(services.dt.dt.normalize()<high)].copy()
-def edge_os(a,b):
-    low=pd.Timestamp(a); high=pd.Timestamp(b)
-    return services[(services.dt.dt.normalize()==low)|(services.dt.dt.normalize()==high)].copy()
-st.subheader(f"📈 Evolução da frota: {start} → {end}")
-if any(coverage_by_day[d]!="completa" for d in days):
-    st.warning("Há fotografias filtradas neste período. Ausência de placa nelas NÃO significa veículo saudável nem recuperado. Indicadores de frota total só são válidos para fotografias completas.")
-fleet=[]
-for d in days:
-    snap=health[health.data_base==d]
-    counts=snap.categoria.value_counts()
-    fleet.append({"Fotografia":d,"Cobertura":coverage_by_day[d],"Placas presentes":snap.placa.nunique(),"Saudável":int(counts.get("Saudável",0)),"Avalie":int(counts.get("Avalie",0)),"Atenção":int(counts.get("Atenção",0))})
-st.dataframe(pd.DataFrame(fleet),hide_index=True,use_container_width=True)
-st.caption("Contagens de fotografias filtradas representam apenas placas presentes no arquivo, não o saldo total da frota.")
-all_plates=set()
-for d in days:all_plates.update(health_by_day[d])
-all_plates.update(services[(services.dt.dt.normalize()>=pd.Timestamp(start))&(services.dt.dt.normalize()<=pd.Timestamp(end))].placa)
-matrix=[]
-for pl in sorted(all_plates):
-    row={"Placa":pl}
-    for d in days:row[d]=health_value(d,pl)
-    row["Evolução inicial → final"]=evolve(row[start],row[end])
-    matrix.append(row)
-timeline=pd.DataFrame(matrix)
-st.subheader("🚛 Evolução individual por placa")
-st.dataframe(timeline,hide_index=True,use_container_width=True)
-st.download_button("⬇️ Baixar evolução por placa",csv_bytes(timeline),"evolucao_frota.csv","text/csv")
-st.subheader("🔧 Efetividade entre fotografias consecutivas")
-results=[];details=[];boundary=[]
-for a,b in zip(days[:-1],days[1:]):
-    jobs=interval_os(a,b)
-    ambiguous=edge_os(a,b)
-    if not ambiguous.empty:
-        boundary.append({"Intervalo":f"{a} → {b}","OS em datas-limite (ordem incerta)":len(ambiguous)})
-    plates_jobs=set(jobs.placa)
-    plates_all=set(health_by_day[a])|set(health_by_day[b])|plates_jobs
-    for pl in sorted(plates_all):
-        x=health_value(a,pl);y=health_value(b,pl)
-        pj=jobs[jobs.placa==pl]
-        change=evolve(x,y)
-        if pl in plates_jobs:
-            if change=="Melhorou":outcome="Melhorou após serviço (associação)"
-            elif change=="Piorou":outcome="Piorou após serviço (investigar)"
-            elif change=="Permaneceu igual" and x in ("Avalie","Atenção"):outcome="Permaneceu em alerta após serviço"
-            elif change=="Permaneceu igual":outcome="Permaneceu igual após serviço"
-            else:outcome="Sem comparação confirmada"
-        else:outcome="Sem OS no intervalo"
-        details.append({"Início":a,"Fim":b,"Placa":pl,"Antes":x,"Depois":y,"Evolução":change,"OS concluídas":len(pj),"Manutenções":int((pj.classe=="Manutenção").sum()),"Instalações":int((pj.classe=="Instalação").sum()),"Protocolos":", ".join(pj.os.fillna("").astype(str).unique()),"Avaliação":outcome})
-    for _,r in jobs.iterrows():
-        x=health_value(a,r.placa);y=health_value(b,r.placa)
-        results.append({"Início":a,"Fim":b,"Data OS":r["dt"],"OS":r.os,"Placa":r.placa,"Cliente":r.cliente,"Tipo":r.classe,"Serviço":r.tipo,"Oficina":r.oficina,"Saúde antes":x,"Saúde depois":y,"Evolução":evolve(x,y)})
-detail=pd.DataFrame(details);job_detail=pd.DataFrame(results)
-if not detail.empty:
-    k=detail[detail["OS concluídas"]>0]
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Placas com OS entre fotografias",k.Placa.nunique())
-    c2.metric("Melhoraram após OS",int((k.Avaliação=="Melhorou após serviço (associação)").sum()))
-    c3.metric("Continuam em alerta",int((k.Avaliação=="Permaneceu em alerta após serviço").sum()))
-    c4.metric("Pioraram após OS",int((k.Avaliação=="Piorou após serviço (investigar)").sum()))
-    st.dataframe(detail,hide_index=True,use_container_width=True)
-    st.download_button("⬇️ Baixar auditoria por placa",csv_bytes(detail),"auditoria_por_placa.csv","text/csv")
-if not job_detail.empty:
-    st.subheader("📋 OS concluídas vinculadas a cada intervalo")
-    st.dataframe(job_detail,hide_index=True,use_container_width=True)
-    st.download_button("⬇️ Baixar auditoria por OS",csv_bytes(job_detail),"auditoria_por_os.csv","text/csv")
-else:st.info("Não há OS concluídas estritamente entre as datas das fotografias selecionadas.")
-if boundary:
-    st.warning("Existem OS no mesmo dia de uma fotografia. Sem horário confiável de extração, elas não entram no cálculo de efetividade, para evitar conclusões incorretas.")
-    st.dataframe(pd.DataFrame(boundary),hide_index=True,use_container_width=True)
-st.caption("Para medir evolução da frota inteira, use fotografias completas semanais. As fotografias filtradas de 27/10 e 02/11 são preservadas como histórico parcial. Uma melhoria observada após OS não demonstra, por si só, que a OS causou a melhoria.")
+    services["classe"]=services.tipo.map(classificar_servico)
+    services=services[services.classe.isin(selected)&services.dt.notna()].copy()
+    terms=[norm(x) for x in extra.split(";") if x.strip()]
+    if only_rota:
+        services=services[services.cliente.map(lambda x:rota(x) or any(t in norm(x) for t in terms))]
+    services=services[(services.dt.dt.date>=start)&(services.dt.dt.date<=date.fromisoformat(end))].copy()
+    services=services[services.status.map(concluida)].copy()
+else:
+    services=pd.DataFrame(columns=["placa","dt","os","classe","cliente","oficina","tipo"])
+
+def placar(label, value, bg, fg="#FFFFFF"):
+    """Card visual. A filtragem detalhada continua nos controles abaixo."""
+    import html
+    label=html.escape(str(label))
+    value=html.escape(f"{value:,}".replace(",", "."))
+    st.markdown(f"""<div style="background:{bg};color:{fg};border-radius:13px;padding:16px 14px;min-height:108px;display:flex;flex-direction:column;justify-content:center;box-shadow:0 1px 4px rgba(0,0,0,.09)">
+    <div style="font-size:clamp(22px,2.8vw,34px);font-weight:750;line-height:1.15">{value}</div>
+    <div style="font-size:13px;font-weight:600;margin-top:8px;line-height:1.25">{label}</div></div>""",unsafe_allow_html=True)
+
+st.subheader("1 · Fotografia atual da frota")
+st.caption(f"Fotografia de {date.fromisoformat(end).strftime('%d/%m/%Y')} · {coverage.get(end,'desconhecida').capitalize()}")
+if coverage.get(end)!="completa":
+    st.warning("Fotografia filtrada: os números representam somente as placas do arquivo, não a frota total.")
+placar("Veículos do cliente · fotografia atual",len(snap),"#165DAA")
+op_categories=["Em operação","Fora de operação","Em manutenção","Cancelado","Sinistrado","Não informado"]
+op_counts={x:int((snap.situacao==x).sum()) for x in op_categories}
+columns=st.columns(3)
+op_colors={"Em operação":("#B8DEFF","#123C66"),"Fora de operação":("#FFD6A1","#6E3C00"),"Em manutenção":("#E5E7EB","#252B36"),"Cancelado":("#C83E45","#FFFFFF"),"Sinistrado":("#6B7280","#FFFFFF"),"Não informado":("#EEF0F3","#394150")}
+for i,cat in enumerate(op_categories):
+    bg,fg=op_colors[cat]
+    with columns[i%3]:placar(cat,op_counts[cat],bg,fg)
+if op_counts["Não informado"]:
+    st.info(f"Situação operacional não identificada para {op_counts['Não informado']} placas. Não serão classificadas automaticamente como em operação. Para calcular o saldo operacional, o CSV precisa ter uma coluna específica de situação operacional.")
+operating=snap[snap.situacao=="Em operação"]
+st.markdown("**Saúde dos veículos em operação**")
+sc=st.columns(4)
+health_colors={"Saudável":("#628D4F","#FFFFFF"),"Avalie":("#C83E45","#FFFFFF"),"Atenção":("#E9AD43","#382800"),"Sem informação":("#E5E7EB","#252B36")}
+for i,cat in enumerate(["Saudável","Avalie","Atenção","Sem informação"]):
+    bg,fg=health_colors[cat]
+    with sc[i]:placar(cat,int((operating.estado==cat).sum()),bg,fg)
+with st.expander("Consultar placas da frota por situação"):
+    choice=st.selectbox("Situação operacional",["Todas"]+op_categories,key="fleet_op")
+    health_choice=st.selectbox("Situação de saúde",["Todas","Saudável","Avalie","Atenção","Sem informação"],key="fleet_health")
+    fleet=snap.copy()
+    if choice!="Todas":fleet=fleet[fleet.situacao==choice]
+    if health_choice!="Todas":fleet=fleet[fleet.estado==health_choice]
+    st.dataframe(fleet[["placa","situacao","estado"]].rename(columns={"placa":"Placa","situacao":"Situação operacional","estado":"Saúde"}),hide_index=True,use_container_width=True)
+    st.download_button("Baixar placas da frota",csv_bytes(fleet),"frota_filtrada.csv","text/csv")
+st.divider()
+st.subheader("2 · Resultado dos serviços")
+st.caption(f"OS concluídas de {start.strftime('%d/%m/%Y')} a {date.fromisoformat(end).strftime('%d/%m/%Y')} · situação na fotografia de {date.fromisoformat(end).strftime('%d/%m/%Y')}")
+if services.empty:
+    st.warning("Não há OS concluídas dos tipos selecionados no período. Confira CSVs, datas e filtro de clientes.")
+    st.stop()
+services=services.sort_values("dt")
+plates=services.placa.dropna().unique().tolist()
+by_plate=[]
+for pl in plates:
+    os_rows=services[services.placa==pl]
+    last=os_rows.iloc[-1]
+    now=current.get(pl,"Sem informação" if coverage.get(end)!="completa" else "Não localizado")
+    earlier=photos[photos.data_base<end].data_base.tolist()
+    prev="Sem informação"
+    prev_date=""
+    # Fotografia anterior mais recente que seja anterior à OS mais antiga da placa.
+    first_os=os_rows.dt.min().date()
+    for d in reversed(earlier):
+        if date.fromisoformat(d)>=first_os: continue
+        matching=health[(health.data_base==d)&(health.placa==pl)]
+        if not matching.empty:
+            prev=status(matching.iloc[-1].status);prev_date=d;break
+    movement=evolve(prev,now)
+    if movement=="Melhorou":result="Melhorou (confirmado entre fotografias)"
+    elif movement=="Piorou":result="Piorou (confirmado entre fotografias)"
+    elif movement=="Permaneceu igual":result="Sem mudança confirmada"
+    else:result="Sem comparação anterior"
+    by_plate.append({"Placa":pl,"OS concluídas":len(os_rows),"Última OS":str(last.os),"Último serviço":last.dt.strftime("%d/%m/%Y"),"Tipo":last.classe,"Oficina":last.oficina,"Cliente":last.cliente,"Saúde atual":now,"Situação operacional":current_op.get(pl,"Não informado"),"Saúde anterior":prev,"Data anterior":prev_date,"Evolução":result})
+detail=pd.DataFrame(by_plate)
+valid=detail["Saúde atual"].isin(["Saudável","Avalie","Atenção"])
+healthy=int((detail["Saúde atual"]=="Saudável").sum())
+avalie=int((detail["Saúde atual"]=="Avalie").sum())
+atencao=int((detail["Saúde atual"]=="Atenção").sum())
+unknown=int((~valid).sum())
+a,b=st.columns(2)
+with a:placar("OS concluídas no período",len(services),"#173A67")
+with b:placar("Placas distintas atendidas",len(detail),"#20252B")
+st.markdown("**Como estão hoje as placas atendidas?**")
+status_cards=st.columns(4)
+for i,(name,num) in enumerate([("Saudável",healthy),("Avalie",avalie),("Atenção",atencao),("Sem informação",unknown)]):
+    bg,fg=health_colors[name]
+    with status_cards[i]:placar(name,num,bg,fg)
+st.caption("Os números acima são placas únicas; uma mesma placa pode ter várias OS. Saúde atual não comprova recuperação causada pelo serviço.")
+if (services.dt.dt.date==date.fromisoformat(end)).any():
+    st.warning("Há OS no mesmo dia da fotografia. Sem horários confiáveis, o status pode ter sido coletado antes do serviço.")
+choice=st.radio("Clique para listar as placas",["Todas","Saudável","Avalie","Atenção","Sem informação"],horizontal=True,key="service_status")
+shown=detail.copy()
+if choice=="Sem informação":shown=shown[~shown["Saúde atual"].isin(["Saudável","Avalie","Atenção"])]
+elif choice!="Todas":shown=shown[shown["Saúde atual"]==choice]
+st.dataframe(shown[["Placa","Último serviço","Tipo","OS concluídas","Última OS","Saúde atual","Situação operacional"]],hide_index=True,use_container_width=True)
+st.download_button("⬇️ Baixar placas atendidas",csv_bytes(shown),"placas_atendidas.csv","text/csv")
+restrictions=detail[detail["Situação operacional"].isin(["Fora de operação","Em manutenção","Cancelado","Sinistrado"])]
+if not restrictions.empty:
+    st.warning(f"{len(restrictions)} placas atendidas constam com restrição operacional na fotografia atual. Verifique as datas: a restrição atual não comprova que existia quando a OS foi executada.")
+    with st.expander("Ver OS de placas com restrição operacional"):
+        st.dataframe(restrictions,hide_index=True,use_container_width=True)
+with st.expander("Ver todas as OS e detalhes técnicos"):
+    raw=services.copy()
+    raw["Data OS"]=raw.dt.dt.strftime("%d/%m/%Y %H:%M")
+    raw["Saúde atual"]=raw.placa.map(lambda x:current.get(x,"Sem informação" if coverage.get(end)!="completa" else "Não localizado"))
+    st.dataframe(raw[["Data OS","os","placa","cliente","classe","tipo","oficina","Saúde atual"]],hide_index=True,use_container_width=True)
+    st.download_button("⬇️ Baixar todas as OS",csv_bytes(raw.drop(columns=["dt"])),"servicos_periodo.csv","text/csv")
+with st.expander("Ver fotografias e histórico da frota"):
+    sums=health.groupby("data_base").agg(placas=("placa","nunique")).reset_index()
+    st.dataframe(photos.merge(sums,on="data_base",how="left"),hide_index=True,use_container_width=True)
+    st.caption("Arquivos filtrados não representam a frota total. Uma placa ausente não é automaticamente saudável.")
+    if len(dates)>1:
+        previous=[x for x in dates if x<end]
+        if previous:
+            old=st.selectbox("Comparar fotografia atual com",previous,index=len(previous)-1)
+            oldmap=dict(zip(health[health.data_base==old].placa,health[health.data_base==old].status.map(status)))
+            evolution=detail[["Placa","Saúde atual"]].copy()
+            evolution["Saúde em "+old]=evolution.Placa.map(lambda p:oldmap.get(p,"Sem informação"))
+            evolution["Evolução"]=evolution.apply(lambda r:evolve(r["Saúde em "+old],r["Saúde atual"]),axis=1)
+            st.dataframe(evolution,hide_index=True,use_container_width=True)
+            st.download_button("⬇️ Baixar comparação",csv_bytes(evolution),"comparacao_fotografias.csv","text/csv")
+st.caption("O painel distingue saúde e situação operacional. Restrições atuais são sinalizadas, mas não expurgam automaticamente OS históricas sem comprovação da restrição na data do serviço.")
