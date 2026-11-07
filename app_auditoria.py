@@ -225,7 +225,8 @@ with st.sidebar:
     selected=st.multiselect("Tipos de serviço",["Manutenção","Instalação","Reinstalação","Upgrade"],default=["Manutenção"],key="service_types")
     only_rota=st.checkbox("Somente Grupo Rota",value=True)
     extra=st.text_input("Outros nomes do Grupo Rota (separados por ;)")
-    exec_filter=st.radio("Tipo de execução",["Geral","Própria","Terceira","Não identificado"],horizontal=False,key="exec_filter")
+    exec_filter=st.selectbox("Tipo de execução",["Geral","Própria","Terceira","Não identificado"],key="exec_filter")
+    repeat_filter=st.selectbox("Reincidência de serviços",["Todos os serviços","Própria → Terceira","Terceira → Própria","Mesma modalidade"],key="repeat_filter")
     st.caption("As datas inicial e final são inclusivas. A fotografia final deve ter sido extraída depois dos serviços para confirmar o estado posterior.")
 
 snap=health[health.data_base==end].drop_duplicates("placa").copy()
@@ -289,6 +290,64 @@ with st.expander("Consultar placas da frota por situação"):
     st.download_button("Baixar placas da frota",csv_bytes(fleet),"frota_filtrada.csv","text/csv")
 st.divider()
 st.subheader("2 · Resultado dos serviços")
+# A sequência de atendimentos deve ser calculada ANTES de filtrar a modalidade
+# de execução: caso contrário, retornos cruzados desaparecem do histórico.
+history=services.copy()
+repeat_rows=[]
+if not history.empty:
+    history=history.sort_values(["placa","dt","os"],kind="stable")
+    history["os_chave"]=history["os"].fillna("").astype(str).str.strip()
+    # Uma mesma OS importada em CSVs sobrepostos não é um novo atendimento.
+    history=history.drop_duplicates(subset=["placa","os_chave"],keep="last")
+    for placa,grupo in history.groupby("placa",sort=False):
+        grupo=grupo.sort_values(["dt","os"],kind="stable")
+        anterior=None
+        for _,atual in grupo.iterrows():
+            if anterior is not None:
+                origem=anterior["Tipo de execução"]
+                destino=atual["Tipo de execução"]
+                if origem=="Própria" and destino=="Terceira":categoria="Própria → Terceira"
+                elif origem=="Terceira" and destino=="Própria":categoria="Terceira → Própria"
+                elif origem==destino and origem in ("Própria","Terceira"):categoria="Mesma modalidade"
+                else:categoria="Não identificado"
+                repeat_rows.append({
+                    "Placa":placa,"Primeira OS":str(anterior["os"]),
+                    "Data inicial":anterior["dt"],"Oficina inicial":anterior["oficina"],
+                    "OS seguinte":str(atual["os"]),"Data seguinte":atual["dt"],
+                    "Oficina seguinte":atual["oficina"],
+                    "Intervalo (dias)":(atual["dt"]-anterior["dt"]).days,
+                    "Transição":categoria,
+                    "Tipo inicial":anterior["classe"],"Tipo seguinte":atual["classe"]
+                })
+            anterior=atual
+repeat_df=pd.DataFrame(repeat_rows)
+if repeat_filter!="Todos os serviços":
+    filtered_repeat=repeat_df[repeat_df["Transição"]==repeat_filter].copy() if not repeat_df.empty else pd.DataFrame()
+    # Mostrar os atendimentos que participam das sequências selecionadas.
+    chosen=set()
+    if not filtered_repeat.empty:
+        for _,rr in filtered_repeat.iterrows():
+            chosen.add((rr["Placa"],rr["Primeira OS"]))
+            chosen.add((rr["Placa"],rr["OS seguinte"]))
+    services=services[services.apply(lambda rr:(rr["placa"],str(rr["os"])) in chosen,axis=1)].copy()
+with st.expander("Analisar possíveis retrabalhos",expanded=False):
+    st.caption("Repetição de placa em OS distintas é indício de retorno, não comprovação de retrabalho. Sequências calculadas antes do filtro de execução, usando o período e tipos de serviço selecionados.")
+    if repeat_df.empty:
+        st.info("Nenhuma placa com duas OS distintas nos filtros de período e serviço.")
+    else:
+        report=repeat_df if repeat_filter=="Todos os serviços" else repeat_df[repeat_df["Transição"]==repeat_filter]
+        if exec_filter!="Geral":
+            # Uma transição cruzada deve continuar visível se envolver a modalidade escolhida.
+            report=report[report["Transição"].map(lambda x: exec_filter=="Própria" and "Própria" in x or exec_filter=="Terceira" and "Terceira" in x or exec_filter=="Não identificado" and x=="Não identificado")]
+        x,y,z=st.columns(3)
+        x.metric("OS únicas",len(history))
+        y.metric("Placas com retorno",report["Placa"].nunique())
+        z.metric("Retornos cruzados",int(report["Transição"].isin(["Própria → Terceira","Terceira → Própria"]).sum()))
+        show=report.copy()
+        for dc in ("Data inicial","Data seguinte"):
+            show[dc]=pd.to_datetime(show[dc]).dt.strftime("%d/%m/%Y")
+        st.dataframe(show,hide_index=True,use_container_width=True)
+        st.download_button("Baixar possíveis retornos",csv_bytes(show),"possiveis_retornos.csv","text/csv")
 if not services.empty:
     counts=services["Tipo de execução"].value_counts()
     st.caption("Classificação pelo nome da oficina executora; a coluna Cliente Oficina Própria não é utilizada.")
