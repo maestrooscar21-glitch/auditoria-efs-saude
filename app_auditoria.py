@@ -38,6 +38,7 @@ def classificar_servico(x):
     n=norm(x)
     if any(t in n for t in ("RETIRADA", "RETIRAR", "DESINSTAL", "REMOCAO", "REMOVER")):
         return None
+    if "UPGRADE" in n or "UP-GRADE" in n or "UP GRADE" in n: return "Upgrade"
     if "REINSTAL" in n: return "Reinstalação"
     if "MANUTEN" in n: return "Manutenção"
     if "INSTAL" in n: return "Instalação"
@@ -125,6 +126,7 @@ with st.sidebar:
             st.rerun()
         except Exception as e:st.error(str(e))
     fs=st.file_uploader("EFS — vários arquivos CSV ou XLSX",type=["csv","xlsx"],accept_multiple_files=True,key="efs")
+    st.caption("Para incluir upgrades antigos, reimporte os CSVs EFS históricos: versões anteriores não gravavam essas OS.")
     if st.button("Salvar OS concluídas",disabled=not fs,use_container_width=True):
         try:
             n,bad=import_efs(fs)
@@ -190,7 +192,7 @@ with st.sidebar:
     end=st.selectbox("Fotografia atual",dates,index=len(dates)-1)
     first=date.fromisoformat(dates[0])
     start=st.date_input("Serviços executados a partir de",value=first,max_value=date.fromisoformat(end),key="period_start")
-    selected=st.multiselect("Tipos de serviço",["Manutenção","Instalação","Reinstalação"],default=["Manutenção"],key="service_types")
+    selected=st.multiselect("Tipos de serviço",["Manutenção","Instalação","Reinstalação","Upgrade"],default=["Manutenção"],key="service_types")
     only_rota=st.checkbox("Somente Grupo Rota",value=True)
     extra=st.text_input("Outros nomes do Grupo Rota (separados por ;)")
     st.caption("As datas inicial e final são inclusivas. A fotografia final deve ter sido extraída depois dos serviços para confirmar o estado posterior.")
