@@ -49,7 +49,37 @@ def concluida(x):
     return "CONCLUID" in n and not any(t in n for t in ("NAO CONCLUID", "N CONCLUID", "INCONCLUID"))
 
 def rota(x):
-    return any(t in norm(x) for t in ("ROTA TRANSP","CIDADE SOL","GRUPO BRASILEIRO","BRASILEIRO ROTA","VIACAO GQE","AVIACAO GQE","GQE"))
+    """Somente empresas confirmadas do Grupo Rota; sem variantes GQ/GQE."""
+    n = norm(x)
+    return any(t in n for t in (
+        "ROTA -", "ROTA TRANSP", "ROTA TRANSPORT", "CIDADE SOL",
+        "GRUPO BRASILEIRO", "BRASILEIRO ROTA", "EXPRESSO BRASILEIRO",
+        "VIACAO JEQUIE"
+    ))
+
+def tipo_execucao(oficina):
+    """Classifica pelo EXECUTOR (Oficina), nunca pela coluna Cliente Oficina Própria.
+    Na dúvida, não atribui à rede terceira automaticamente.
+    """
+    n = norm(oficina)
+    if not n or n in ("NAN", "NONE", "NULL", "-"):
+        return "Não identificado"
+    if n.startswith("ROTA -") or n.startswith("ROTA ") or any(t in n for t in (
+        "CIDADE SOL", "VIACAO JEQUIE", "EXPRESSO BRASILEIRO",
+        "GRUPO BRASILEIRO", "BRASILEIRO ROTA"
+    )):
+        return "Própria"
+    terceiros = (
+        "FILT", "RK AUTO", "LUCAS NEIVA", "FEIRA RASTREADORES",
+        "HASTAG", "HASHTAG", "INTEGRASOM", "YESHUA", "CRISTIANO LIMA",
+        "BRENO ARRUDA", "CARDOSO", "JUÁ", "JUA RASTREADORES",
+        "ON TRACK", "ONTRACK", "JMP", "MANOEL PEREIRA",
+        "JOAO JOSE", "LG2", "TOPSON", "PRO RACK", "LOPES RASTREADORES"
+    )
+    if any(t in n for t in terceiros):
+        return "Terceira"
+    return "Não identificado"
+
 def init():
     with sqlite3.connect(DB) as c:
         c.execute("CREATE TABLE IF NOT EXISTS servicos (chave TEXT PRIMARY KEY, placa TEXT, cliente TEXT, os TEXT, data TEXT, tipo TEXT, classe TEXT, status TEXT, oficina TEXT, origem TEXT)")
@@ -195,6 +225,7 @@ with st.sidebar:
     selected=st.multiselect("Tipos de serviço",["Manutenção","Instalação","Reinstalação","Upgrade"],default=["Manutenção"],key="service_types")
     only_rota=st.checkbox("Somente Grupo Rota",value=True)
     extra=st.text_input("Outros nomes do Grupo Rota (separados por ;)")
+    exec_filter=st.radio("Tipo de execução",["Geral","Própria","Terceira","Não identificado"],horizontal=False,key="exec_filter")
     st.caption("As datas inicial e final são inclusivas. A fotografia final deve ter sido extraída depois dos serviços para confirmar o estado posterior.")
 
 snap=health[health.data_base==end].drop_duplicates("placa").copy()
@@ -214,8 +245,9 @@ if not services.empty:
         services=services[services.cliente.map(lambda x:rota(x) or any(t in norm(x) for t in terms))]
     services=services[(services.dt.dt.date>=start)&(services.dt.dt.date<=date.fromisoformat(end))].copy()
     services=services[services.status.map(concluida)].copy()
+    services["Tipo de execução"]=services.oficina.map(tipo_execucao)
 else:
-    services=pd.DataFrame(columns=["placa","dt","os","classe","cliente","oficina","tipo"])
+    services=pd.DataFrame(columns=["placa","dt","os","classe","cliente","oficina","tipo","Tipo de execução"])
 
 def placar(label, value, bg, fg="#FFFFFF"):
     """Card visual. A filtragem detalhada continua nos controles abaixo."""
@@ -257,6 +289,18 @@ with st.expander("Consultar placas da frota por situação"):
     st.download_button("Baixar placas da frota",csv_bytes(fleet),"frota_filtrada.csv","text/csv")
 st.divider()
 st.subheader("2 · Resultado dos serviços")
+if not services.empty:
+    counts=services["Tipo de execução"].value_counts()
+    st.caption("Classificação pelo nome da oficina executora; a coluna Cliente Oficina Própria não é utilizada.")
+    c1,c2,c3,c4=st.columns(4)
+    for column, name in zip((c1,c2,c3,c4),("Geral","Própria","Terceira","Não identificado")):
+        with column:
+            st.metric(name, len(services) if name=="Geral" else int(counts.get(name,0)))
+    if int(counts.get("Não identificado",0)):
+        with st.expander("Revisar oficinas não identificadas"):
+            st.dataframe(services.loc[services["Tipo de execução"]=="Não identificado",["oficina","cliente"]].drop_duplicates(),hide_index=True,use_container_width=True)
+    if exec_filter!="Geral":
+        services=services[services["Tipo de execução"]==exec_filter].copy()
 st.caption(f"OS concluídas de {start.strftime('%d/%m/%Y')} a {date.fromisoformat(end).strftime('%d/%m/%Y')} · situação na fotografia de {date.fromisoformat(end).strftime('%d/%m/%Y')}")
 if services.empty:
     st.warning("Não há OS concluídas dos tipos selecionados no período. Confira CSVs, datas e filtro de clientes.")
@@ -283,7 +327,7 @@ for pl in plates:
     elif movement=="Piorou":result="Piorou (confirmado entre fotografias)"
     elif movement=="Permaneceu igual":result="Sem mudança confirmada"
     else:result="Sem comparação anterior"
-    by_plate.append({"Placa":pl,"OS concluídas":len(os_rows),"Última OS":str(last["os"]),"Último serviço":pd.to_datetime(last["dt"],errors="coerce").strftime("%d/%m/%Y") if pd.notna(pd.to_datetime(last["dt"],errors="coerce")) else "Data não informada","Tipo":last.classe,"Oficina":last.oficina,"Cliente":last.cliente,"Saúde atual":now,"Situação operacional":current_op.get(pl,"Não informado"),"Saúde anterior":prev,"Data anterior":prev_date,"Evolução":result})
+    by_plate.append({"Placa":pl,"OS concluídas":len(os_rows),"Última OS":str(last["os"]),"Último serviço":pd.to_datetime(last["dt"],errors="coerce").strftime("%d/%m/%Y") if pd.notna(pd.to_datetime(last["dt"],errors="coerce")) else "Data não informada","Tipo":last.classe,"Tipo de execução":last["Tipo de execução"],"Oficina":last.oficina,"Cliente":last.cliente,"Saúde atual":now,"Situação operacional":current_op.get(pl,"Não informado"),"Saúde anterior":prev,"Data anterior":prev_date,"Evolução":result})
 detail=pd.DataFrame(by_plate)
 valid=detail["Saúde atual"].isin(["Saudável","Avalie","Atenção"])
 healthy=int((detail["Saúde atual"]=="Saudável").sum())
@@ -305,7 +349,7 @@ choice=st.radio("Clique para listar as placas",["Todas","Saudável","Avalie","At
 shown=detail.copy()
 if choice=="Sem informação":shown=shown[~shown["Saúde atual"].isin(["Saudável","Avalie","Atenção"])]
 elif choice!="Todas":shown=shown[shown["Saúde atual"]==choice]
-st.dataframe(shown[["Placa","Último serviço","Tipo","OS concluídas","Última OS","Saúde atual","Situação operacional"]],hide_index=True,use_container_width=True)
+st.dataframe(shown[["Placa","Último serviço","Tipo","OS concluídas","Última OS","Tipo de execução","Saúde atual","Situação operacional"]],hide_index=True,use_container_width=True)
 st.download_button("⬇️ Baixar placas atendidas",csv_bytes(shown),"placas_atendidas.csv","text/csv")
 restrictions=detail[detail["Situação operacional"].isin(["Fora de operação","Em manutenção","Cancelado","Sinistrado"])]
 if not restrictions.empty:
@@ -316,7 +360,7 @@ with st.expander("Ver todas as OS e detalhes técnicos"):
     raw=services.copy()
     raw["Data OS"]=raw.dt.dt.strftime("%d/%m/%Y %H:%M")
     raw["Saúde atual"]=raw.placa.map(lambda x:current.get(x,"Sem informação" if coverage.get(end)!="completa" else "Não localizado"))
-    st.dataframe(raw[["Data OS","os","placa","cliente","classe","tipo","oficina","Saúde atual"]],hide_index=True,use_container_width=True)
+    st.dataframe(raw[["Data OS","os","placa","cliente","classe","tipo","oficina","Tipo de execução","Saúde atual"]],hide_index=True,use_container_width=True)
     st.download_button("⬇️ Baixar todas as OS",csv_bytes(raw.drop(columns=["dt"])),"servicos_periodo.csv","text/csv")
 with st.expander("Ver fotografias e histórico da frota"):
     sums=health.groupby("data_base").agg(placas=("placa","nunique")).reset_index()
