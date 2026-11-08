@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
-import sqlite3, io, re, unicodedata, hashlib, os
+import io, re, unicodedata, hashlib
+from supabase_backend import load_data, save_services, save_health, count
 from datetime import date
 
 st.set_page_config(page_title="Auditoria EFS × Saúde", page_icon="🚛", layout="wide")
-DB="auditoria_local.sqlite3"
+# Dados persistidos no Supabase (Secrets do Streamlit)
 
 def norm(x):
     return "".join(c for c in unicodedata.normalize("NFKD", str(x)) if not unicodedata.combining(c)).upper().strip()
@@ -80,33 +81,31 @@ def tipo_execucao(oficina):
         return "Terceira"
     return "Não identificado"
 
-def init():
-    with sqlite3.connect(DB) as c:
-        c.execute("CREATE TABLE IF NOT EXISTS servicos (chave TEXT PRIMARY KEY, placa TEXT, cliente TEXT, os TEXT, data TEXT, tipo TEXT, classe TEXT, status TEXT, oficina TEXT, origem TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS saude (data_base TEXT, placa TEXT, status TEXT, origem TEXT, PRIMARY KEY(data_base,placa))")
-        c.execute("CREATE TABLE IF NOT EXISTS operacao (data_base TEXT, placa TEXT, situacao TEXT, PRIMARY KEY(data_base,placa))")
-        c.execute("CREATE TABLE IF NOT EXISTS fotografias (data_base TEXT PRIMARY KEY, cobertura TEXT NOT NULL, arquivo TEXT, importado_em TEXT DEFAULT CURRENT_TIMESTAMP)")
 def import_efs(files):
     inserted=0; skipped=0
-    with sqlite3.connect(DB) as c:
-        for f in files:
-            d=read(f); p=col(d,"Placa"); cli=col(d,"Cliente"); typ=col(d,"Tipo de Atividade"); sta=col(d,"Status da Atividade")
-            if not all((p,cli,typ,sta)):raise ValueError(f"{f.name}: faltam colunas EFS (Placa, Cliente, Tipo de Atividade, Status da Atividade)")
-            oscol=col(d,"OS","Protocolo"); idcol=col(d,"ID da Atividade"); dt=col(d,"Data","Data de Conclusão","Data de Execução"); of=col(d,"Oficina")
-            if not dt: raise ValueError(f"{f.name}: coluna de data não identificada; necessário para a cronologia")
-            for _,r in d.iterrows():
-                pl=plate(r[p]); s=norm(r[sta])
-                if not pl or not concluida(s): continue
-                data=pd.to_datetime(r[dt],dayfirst=True,errors="coerce")
-                if pd.isna(data):skipped+=1;continue
-                typv=str(r[typ]); classe=classificar_servico(typv)
-                if classe is None: continue
-                oid=str(r[oscol]).strip() if oscol and pd.notna(r[oscol]) else ""
-                aid=str(r[idcol]).strip() if idcol and pd.notna(r[idcol]) else ""
-                key=("OS:"+oid if oid else "ID:"+aid if aid else "HASH:"+hashlib.sha256((pl+str(r[cli])+typv+data.isoformat()).encode()).hexdigest())
-                c.execute("INSERT OR REPLACE INTO servicos VALUES (?,?,?,?,?,?,?,?,?,?)",(key,pl,str(r[cli]),oid,data.isoformat(),typv,classe,str(r[sta]),str(r[of]) if of else "",f.name))
-                inserted+=1
+    records=[]
+    for f in files:
+        d=read(f); p=col(d,"Placa"); cli=col(d,"Cliente"); typ=col(d,"Tipo de Atividade"); sta=col(d,"Status da Atividade")
+        if not all((p,cli,typ,sta)):
+            raise ValueError(f"{f.name}: faltam colunas EFS (Placa, Cliente, Tipo de Atividade, Status da Atividade)")
+        oscol=col(d,"OS","Protocolo"); idcol=col(d,"ID da Atividade"); dt=col(d,"Data","Data de Conclusão","Data de Execução"); of=col(d,"Oficina")
+        if not dt: raise ValueError(f"{f.name}: coluna de data não identificada; necessário para a cronologia")
+        for _,r in d.iterrows():
+            pl=plate(r[p]); status_os=norm(r[sta])
+            if not pl or not concluida(status_os): continue
+            data=pd.to_datetime(r[dt],dayfirst=True,errors="coerce")
+            if pd.isna(data): skipped+=1; continue
+            typv=str(r[typ]); classe=classificar_servico(typv)
+            if classe is None: continue
+            oid=str(r[oscol]).strip() if oscol and pd.notna(r[oscol]) else ""
+            aid=str(r[idcol]).strip() if idcol and pd.notna(r[idcol]) else ""
+            key=("OS:"+oid if oid else "ID:"+aid if aid else "HASH:"+hashlib.sha256((pl+str(r[cli])+typv+data.isoformat()).encode()).hexdigest())
+            records.append({"chave":key,"placa":pl,"cliente":str(r[cli]),"os":oid,"data":data.isoformat(),"tipo":typv,"classe":classe,"status":str(r[sta]),"oficina":str(r[of]) if of else "","origem":f.name})
+    # Última ocorrência da mesma chave prevalece, igual ao INSERT OR REPLACE original.
+    unique={row['chave']:row for row in records}
+    inserted=save_services(list(unique.values()))
     return inserted,skipped
+
 def operacao_status(value):
     n=norm(value)
     if not n or n in ("NAN","NONE","NULL","-"): return "Não informado"
@@ -128,20 +127,13 @@ def import_health(f,day,coverage):
         if pl:
             records[pl]=status(r[s])
             operations[pl]=operacao_status(r[opcol]) if opcol else "Não informado"
-    with sqlite3.connect(DB) as c:
-        # Reimportação de uma fotografia substitui completamente a fotografia anterior, sem sobras.
-        c.execute("DELETE FROM saude WHERE data_base=?",(str(day),))
-        c.execute("DELETE FROM operacao WHERE data_base=?",(str(day),))
-        c.executemany("INSERT INTO saude VALUES (?,?,?,?)",[(str(day),p,v,f.name) for p,v in records.items()])
-        c.executemany("INSERT INTO operacao VALUES (?,?,?)",[(str(day),p,v) for p,v in operations.items()])
-        c.execute("INSERT OR REPLACE INTO fotografias(data_base,cobertura,arquivo) VALUES (?,?,?)",(str(day),coverage,f.name))
+    save_health(day,coverage,f.name,records,operations)
     return len(records)
 def evolve(a,b):
     x,y=grade(a),grade(b)
     if x is None or y is None:return "Sem comparação confirmada"
     return "Melhorou" if y>x else "Piorou" if y<x else "Permaneceu igual"
 def csv_bytes(d):return d.to_csv(index=False,sep=";").encode("utf-8-sig")
-init()
 st.title("🚛 Grupo Rota | Visão executiva")
 st.caption("1. Saúde e operação da frota  •  2. Resultado dos serviços concluídos")
 with st.sidebar:
@@ -164,52 +156,21 @@ with st.sidebar:
             st.rerun()
         except Exception as e:st.error(str(e))
     st.divider()
-    st.header("2 · Gerenciar banco")
-    with sqlite3.connect(DB) as c:
-        nos=c.execute("SELECT COUNT(*) FROM servicos").fetchone()[0]
-        nh=c.execute("SELECT COUNT(*) FROM saude").fetchone()[0]
-    st.caption(f"{nos} OS únicas · {nh} registros de saúde")
-    # Backup consistente com conexão SQLite (não apenas cópia do arquivo durante gravações).
-    mem=io.BytesIO()
-    with sqlite3.connect(DB) as source:
-        temp=DB+".backup"
-        with sqlite3.connect(temp) as dest:source.backup(dest)
-    with open(temp,"rb") as f: backup_bytes=f.read()
-    st.download_button("⬇️ Baixar backup SQLite",backup_bytes,"auditoria_local.sqlite3","application/octet-stream",use_container_width=True)
-    restore=st.file_uploader("Restaurar backup (.sqlite3/.db)",type=["sqlite3","db"])
-    if st.button("Restaurar backup",disabled=restore is None,use_container_width=True):
-        try:
-            b=restore.getvalue()
-            if not b.startswith(b"SQLite format 3\x00"):raise ValueError("Não é SQLite")
-            temp=DB+".restore"
-            with open(temp,"wb") as f:f.write(b)
-            with sqlite3.connect(temp) as c:
-                if c.execute("PRAGMA integrity_check").fetchone()[0]!="ok":raise ValueError("Backup corrompido")
-                tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if not {"servicos","saude"}.issubset(tables):raise ValueError("Backup incompatível")
-            os.replace(temp,DB)
-            init()
-            st.success("Backup restaurado")
-            st.rerun()
-        except Exception as e:st.error(str(e))
-    st.caption("Streamlit Community Cloud: armazenamento SQLite local pode ser perdido ao reiniciar. Baixe backups após importações.")
-    sure=st.checkbox("Confirmo a exclusão de todos os dados")
-    typed=st.text_input("Digite ZERAR para confirmar")
-    if st.button("🗑️ Zerar banco",disabled=not(sure and typed=="ZERAR"),use_container_width=True):
-        with sqlite3.connect(DB) as c:
-            c.execute("DELETE FROM servicos");c.execute("DELETE FROM saude");c.execute("DELETE FROM operacao");c.execute("DELETE FROM fotografias")
-        st.rerun()
-with sqlite3.connect(DB) as c:
-    photos=pd.read_sql_query("SELECT data_base,cobertura,arquivo FROM fotografias ORDER BY data_base",c)
-    health=pd.read_sql_query("SELECT * FROM saude",c)
-    services=pd.read_sql_query("SELECT * FROM servicos",c)
-    operation=pd.read_sql_query("SELECT * FROM operacao",c)
+    st.header("2 · Banco permanente")
+    try:
+        st.caption(f"{count('ordens_servico')} OS únicas · {count('saude_frota')} registros de saúde")
+        st.success("Conectado ao Supabase: auditoria-efs-estoque")
+        st.caption("O backup SQLite histórico deve ser guardado separadamente. Este painel não apaga o banco.")
+    except Exception as exc:
+        st.error(f"Falha ao consultar Supabase: {exc}")
+        st.stop()
+try:
+    photos,health,services,operation=load_data()
+except Exception as exc:
+    st.error(f"Falha ao carregar dados do Supabase: {exc}")
+    st.stop()
 if not health.empty and photos.empty:
-    st.warning("Fotografias antigas sem abrangência declarada foram consideradas filtradas até confirmação.")
-    with sqlite3.connect(DB) as c:
-        for d in health.data_base.unique():
-            c.execute("INSERT OR IGNORE INTO fotografias(data_base,cobertura,arquivo) VALUES (?,?,?)",(d,"filtrada","importação anterior"))
-    with sqlite3.connect(DB) as c:photos=pd.read_sql_query("SELECT data_base,cobertura,arquivo FROM fotografias ORDER BY data_base",c)
+    st.warning("Existem registros de saúde sem fotografia cadastrada. Verifique o histórico no Supabase.")
 
 # Painel executivo: uma fotografia atual basta; histórico anterior é opcional.
 if photos.empty:
