@@ -247,8 +247,8 @@ if not services.empty:
     services=services[(services.dt.dt.date>=start)&(services.dt.dt.date<=date.fromisoformat(end))].copy()
     services=services[services.status.map(concluida)].copy()
     if "oficina" not in services.columns:
-            services["oficina"] = ""
-        services["Tipo de execução"] = services["oficina"].map(tipo_execucao)
+        services["oficina"] = ""
+    services["Tipo de execução"] = services["oficina"].map(tipo_execucao)
 else:
     services=pd.DataFrame(columns=["placa","dt","os","classe","cliente","oficina","tipo","Tipo de execução"])
 
