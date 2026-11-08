@@ -246,7 +246,9 @@ if not services.empty:
         services=services[services.cliente.map(lambda x:rota(x) or any(t in norm(x) for t in terms))]
     services=services[(services.dt.dt.date>=start)&(services.dt.dt.date<=date.fromisoformat(end))].copy()
     services=services[services.status.map(concluida)].copy()
-    services["Tipo de execução"]=services.oficina.map(tipo_execucao)
+    if "oficina" not in services.columns:
+            services["oficina"] = ""
+        services["Tipo de execução"] = services["oficina"].map(tipo_execucao)
 else:
     services=pd.DataFrame(columns=["placa","dt","os","classe","cliente","oficina","tipo","Tipo de execução"])
 
